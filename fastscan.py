@@ -1,156 +1,158 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-import argparse, contextlib, html, json, logging, re, signal, socket, sys, threading, time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
-from typing import Final, Iterable, NamedTuple, Self
-import requests
-from requests.exceptions import RequestException
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
-from rich.console import Console
+import asyncio
+import socket
+import json
+import re
+import argparse
+from time import perf_counter
+
+import aiohttp
+from rich.console import Console, Group
 from rich.table import Table
-from rich.text import Text
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
-DEFAULT_RANGE: Final[str] = "1-65535"
-MAX_WORKERS: Final[int] = 1000
-MAX_PARALLEL: Final[int] = 1000
-SOCK_TIMEOUT: Final[float] = 0.05
-HTTP_TIMEOUT: Final[float] = 2.0
-_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
-requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
-console = Console(highlight=False)
-class ScanResult(NamedTuple):
-    port: int
-    service: str
-    title: str | None
-class PortScanner:
-    def __init__(self, host: str, ports: Iterable[int], *, workers: int = MAX_WORKERS, sock_timeout: float = SOCK_TIMEOUT, http_timeout: float = HTTP_TIMEOUT) -> None:
-        self.host, self.ports = host, tuple(ports)
-        self.workers, self.sock_timeout, self.http_timeout = workers, sock_timeout, http_timeout
-        self._sem = threading.BoundedSemaphore(MAX_PARALLEL)
-        self._executor: ThreadPoolExecutor | None = None
-        self._latency: float | None = None
-        self._scanned = 0
-    def __enter__(self) -> Self:
-        self._executor = ThreadPoolExecutor(max_workers=self.workers)
-        return self
-    def __exit__(self, *_exc) -> bool:
-        if self._executor:
-            self._executor.shutdown(wait=True, cancel_futures=True)
-        return False
-    def scan(self) -> list[ScanResult]:
-        futs = {self._executor.submit(self._probe, p): p for p in self.ports}
-        res: list[ScanResult] = []
-        for fut in as_completed(futs):
-            self._scanned += 1
-            r = fut.result()
-            if r:
-                res.append(r)
-        return res
-    def _probe(self, port: int) -> ScanResult | None:
+from rich.panel import Panel
+from rich.progress import Progress, TextColumn, BarColumn, TimeElapsedColumn
+from rich.live import Live
+
+######## CONFIG ########
+DEFAULT_TIMEOUT     = 1.0     # сек. на TCP-connect
+DEFAULT_HTTP_TOUT   = 3.0     # сек. на HTTP GET
+DEFAULT_CONCURRENCY = 500     # одновременные TCP-коннекты
+HTTPS_PORTS         = {443, 8443, 9443}
+MAX_TITLE_LEN       = 100
+########################
+
+console = Console()
+
+####################################################################
+async def scan_port(ip: str, port: int, sem: asyncio.Semaphore,
+                    http_session: aiohttp.ClientSession, hostname_for_http: str,
+                    do_web: bool) -> dict | None:
+    async with sem:
         try:
-            t0 = time.perf_counter()
-            with self._sem:
-                if not self._tcp_open(port):
-                    return None
-            dt = time.perf_counter() - t0
-            if self._latency is None or dt < self._latency:
-                self._latency = dt
-            service, title = self._http_info(port)
-            return ScanResult(port, service, title)
-        except Exception:
-            return None
-    def _tcp_open(self, port: int) -> bool:
-        try:
-            for fam, typ, pr, _, addr in socket.getaddrinfo(self.host, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP):
-                with contextlib.closing(socket.socket(fam, typ, pr)) as s:
-                    s.settimeout(self.sock_timeout)
-                    if s.connect_ex(addr) == 0:
-                        return True
-        except OSError:
-            pass
-        return False
-    def _http_info(self, port: int) -> tuple[str, str | None]:
-        try:
-            service = socket.getservbyport(port, "tcp")
-        except OSError:
-            service = ""
-        sess = requests.Session()
-        for scheme in ("http", "https"):
-            url = f"{scheme}://{self.host}:{port}/"
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port), timeout=DEFAULT_TIMEOUT
+            )
+            writer.close()
             try:
-                head = sess.head(url, timeout=self.http_timeout, allow_redirects=True, verify=False)
-            except RequestException:
-                continue
-            if 100 <= head.status_code < 600:
-                try:
-                    body = sess.get(url, timeout=self.http_timeout, allow_redirects=True, verify=False).text
-                    t = self._extract_title(body)
-                    if t:
-                        return service or scheme, t
-                except RequestException:
-                    pass
-                return service or scheme, ""
-        return service, None
-    @staticmethod
-    def _extract_title(doc: str) -> str | None:
-        m = _TITLE_RE.search(doc)
-        return html.unescape(m.group(1)).strip() if m else None
-def parse_ports(spec: str) -> list[int]:
-    out: set[int] = set()
-    for part in spec.split(","):
-        if "-" in part:
-            a, b = map(int, part.split("-", 1))
-            out.update(range(a, b + 1))
-        else:
-            out.add(int(part))
-    return sorted(out)
-def header_text(host: str, ip: str, filt: int, lat: float) -> Text:
-    now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
-    return Text.assemble(("Starting FastScan 1.0", "bold yellow"), (" ( https://github.com/MarcusovP/FastScan ) at ", "yellow"), (now + "\n", "yellow"), ("Scan report for ", "bold"), (host, "cyan bold"), (" (", ""), (ip, "magenta"), (")\n", ""), ("Host is up ", "green"), (f"({lat:.3f}s latency).\n", ""), ("Not shown: ", "dim"), (f"{filt:,}", "dim"), (" filtered tcp ports (no-response)\n\n", "dim"))
-def build_table(results: list[ScanResult]) -> Table:
-    t = Table(show_header=True, header_style="bold")
-    t.add_column("PORT", style="cyan", width=8)
-    t.add_column("STATE", style="green")
-    t.add_column("SERVICE", style="magenta")
-    t.add_column("TITLE")
-    for r in sorted(results, key=lambda x: x.port):
-        t.add_row(f"{r.port}/tcp", "open", r.service or "?", r.title or "")
-    return t
-def print_summary(elapsed: float) -> None:
-    console.print(Text.assemble(("\nFastScan done: 1 IP address (1 host up) scanned in ", "dim"), (f"{elapsed:.2f}", "bold"), (" seconds\n", "dim")))
-def save_json(path: str, results: list[ScanResult]) -> None:
-    json.dump([r._asdict() for r in results], open(path, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("host")
-    p.add_argument("-r", "--range", default=DEFAULT_RANGE)
-    p.add_argument("-w", "--workers", type=int, default=MAX_WORKERS)
-    p.add_argument("-j", "--json")
-    args = p.parse_args()
-    signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
-    logging.basicConfig(level=logging.WARNING)
-    ports = parse_ports(args.range)
-    bar = Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), BarColumn(), TextColumn("{task.completed}/{task.total}"), TimeElapsedColumn(), console=console, transient=True)
-    task = bar.add_task(f"[yellow]Scanning {args.host}", total=len(ports))
-    t0 = time.perf_counter()
-    with bar, PortScanner(args.host, ports, workers=args.workers) as scanner:
-        box: list[list[ScanResult]] = []
-        thr = threading.Thread(target=lambda: box.append(scanner.scan()))
-        thr.start()
-        while thr.is_alive():
-            time.sleep(0.1)
-            bar.update(task, completed=scanner._scanned)
-        thr.join()
-    elapsed = time.perf_counter() - t0
-    results = box[0]
-    ip = socket.gethostbyname(args.host)
-    console.print(header_text(args.host, ip, len(ports) - len(results), scanner._latency or 0.0))
-    console.print(build_table(results))
-    print_summary(elapsed)
-    if args.json:
-        save_json(args.json, results)
-        console.print(f"[blue]Saved JSON → {args.json}[/]")
-    sys.exit(0)
+                await writer.wait_closed()
+            except Exception:
+                pass
+        except Exception:
+            return None                                   # порт закрыт / фильтруется
+
+        # --- Порт открыт ---
+        port_info = {"port": port}
+
+        if not do_web:                                    # только TCP-скан
+            port_info.update(status=None, title="")
+            return port_info
+
+        proto = "https" if port in HTTPS_PORTS else "http"
+        url   = f"{proto}://{hostname_for_http}:{port}"
+
+        try:
+            async with http_session.get(url, allow_redirects=True) as resp:
+                port_info["status"] = resp.status
+                text = await resp.text(errors="ignore")
+                m = re.search(r"(?is)<title>(.*?)</title>", text)
+                title = (m.group(1).strip() if m else "")[:MAX_TITLE_LEN]
+                if len(title) == MAX_TITLE_LEN:
+                    title += "..."
+                port_info["title"] = title
+        except Exception:
+            port_info.update(status=None, title="")       # не HTTP-сервис или TLS-ошибка
+
+        return port_info
+####################################################################
+
+async def run_scan(target_host: str, start_port: int, end_port: int,
+                   concurrency: int, do_web: bool, output_file: str | None):
+    # DNS один раз – получаем IP
+    try:
+        ip_addr = socket.gethostbyname(target_host)
+    except socket.gaierror as e:
+        console.print(f"[red]Не удалось резолвить {target_host}: {e}[/red]")
+        return
+
+    total_ports = end_port - start_port + 1
+    console.print(f"[bold cyan]⟹ Сканирую[/bold cyan] [magenta]{target_host}[/magenta] "
+                  f"({ip_addr}) : {start_port}-{end_port}  "
+                  f"([yellow]{total_ports}[/yellow] портов, "
+                  f"конкурентность {concurrency})")
+
+    # Таблица для открытых портов
+    tbl_cols = ("Port", "Status", "Title") if do_web else ("Port",)
+    table = Table(*tbl_cols, title=f"Open Ports on {target_host}")
+
+    # Прогресс-бар
+    progress = Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=None),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    )
+    p_task = progress.add_task("Scanning", total=total_ports)
+
+    conn = aiohttp.TCPConnector(limit=concurrency, ssl=False)   # ssl=False → IGNORE cert
+    async with aiohttp.ClientSession(connector=conn,
+                                     timeout=aiohttp.ClientTimeout(total=DEFAULT_HTTP_TOUT)) as http_sess:
+        sem   = asyncio.Semaphore(concurrency)
+        start = perf_counter()
+
+        tasks = [
+            asyncio.create_task(
+                scan_port(ip_addr, port, sem, http_sess,       # TCP по IP
+                          target_host, do_web)                 # HTTP по hostname  # FIX
+            )
+            for port in range(start_port, end_port + 1)
+        ]
+
+        live_render = Group(table, Panel(progress, title="Progress", border_style="green", padding=(1,1), height=5))
+        with Live(live_render, console=console, refresh_per_second=10, vertical_overflow="visible") as live:
+            for coro in asyncio.as_completed(tasks):
+                res = await coro
+                progress.advance(p_task)
+                if res:                                        # порт открыт
+                    if do_web:
+                        status = str(res["status"]) if res["status"] is not None else "-"
+                        title  = res["title"]
+                        table.add_row(str(res["port"]), status, title)
+                    else:
+                        table.add_row(str(res["port"]))
+                    live.refresh()
+
+        elapsed = perf_counter() - start
+        console.print(f"[bold green]✔ Готово[/bold green] за {elapsed:.1f} с. "
+                      f"Найдено портов: [yellow]{len(table.rows)}[/yellow]")
+
+        if output_file:
+            data_to_dump = [row.cells for row in table.rows]   # simple list
+            try:
+                with open(output_file, "w", encoding="utf-8") as f:
+                    json.dump(data_to_dump, f, indent=2, ensure_ascii=False)
+                console.print(f"[grey]Сохранено в {output_file}[/grey]")
+            except Exception as e:
+                console.print(f"[red]Ошибка записи {output_file}: {e}[/red]")
+
+def parse_args():
+    ap = argparse.ArgumentParser(description="Async-сканер TCP/HTTP с Rich-UI")
+    ap.add_argument("target", help="IP или домен цели")
+    ap.add_argument("--start", type=int, default=1, help="Начальный порт (1)")
+    ap.add_argument("--end",   type=int, default=65535, help="Конечный порт (65535)")
+    ap.add_argument("--threads", type=int, default=DEFAULT_CONCURRENCY,
+                    help=f"Параллельных TCP-коннектов (def {DEFAULT_CONCURRENCY})")
+    ap.add_argument("--web", action="store_true",
+                    help="GET HTTP/HTTPS, показать status/title")
+    ap.add_argument("-o", "--output", help="Файл JSON для результатов")
+    return ap.parse_args()
+
 if __name__ == "__main__":
-    main()
+    try:
+        args = parse_args()
+        asyncio.run(run_scan(args.target, args.start, args.end,
+                             args.threads, args.web, args.output))
+    except KeyboardInterrupt:
+        console.print("\n[red]Прервано пользователем[/red]")
